@@ -5,6 +5,7 @@ CREATE OR REPLACE PROCEDURE fims.sr_tdo201_main (
     P_MSG         OUT VARCHAR2
 )
 IS
+    TYPE T_FLAG_TAB IS TABLE OF VARCHAR2(1) INDEX BY VARCHAR2(100);
 
     XCON_GIJUN_AMT    NUMBER := 10000000;
     WA_BF_YMD         VARCHAR2(8);
@@ -14,21 +15,35 @@ IS
     W_SEOLJ_AEK       NUMBER(20);
     W_DAILY_RT        NUMBER(20,12);
     W_FIX_MAT_RT      NUMBER(20,12);
-    W_T36_YMD         VARCHAR2(8);   -- 추가: TSS003 T/36 기준 FUND_TO_YMD
-    W_T36_JY_YMD      VARCHAR2(8);   -- 추가: 만기 이자 적용일
-    W_T36_GB          VARCHAR2(1);
-    W_UY_YMD          VARCHAR2(8);
+    W_T36_JY_YMD      VARCHAR2(8);   -- 가장 최근 3년 만기 이자 적용일 (만기 익영업일, D1 이하)
+    W_T36_GB          VARCHAR2(1);   -- D1 이 3년 만기일이면 'Y'
+    W_CYC_FROM_YMD    VARCHAR2(8);   -- 3년 주기 시작일 (UY_YMD → 만기 익영업일 → ...)
+    W_MAT_YMD         VARCHAR2(8);   -- 해당 주기의 만기일
+    W_RATE_YMD        VARCHAR2(8);   -- 이율 기준일 (UY_YMD 또는 최근 만기 익영업일)
+    W_DAY_FROM_YMD    VARCHAR2(8);   -- 이자 일수 산정 시작일 (미포함)
+    W_GA_TODAY        NUMBER;        -- 보험펀드 당일 기준가
+    W_GA_PREV         NUMBER;        -- 보험펀드 직전 기준가 (전일 TDO201 이월값)
+    W_GA_CUR          NUMBER;
+    W_I_RT            NUMBER;
+    W_P_TOT_AEK       NUMBER;        -- 전일 000 평가액
+    W_P_SEOLJ_AEK     NUMBER;        -- 전일 000 설정액
+    W_P_SUIK_JISU     NUMBER;        -- 전일 000 수익지수
+    W_000_SEOLJ_GB    VARCHAR2(1);   -- 000 설정액 산출구분 R:리밸런싱 T:3년만기 N:이월
+    W_T36_PRD         T_FLAG_TAB;    -- 당일 3년 만기 이자 적용(설정액 재산출) 상품
+    W_CUR_PRD_CD      VARCHAR2(100); -- 오류 위치 추적용
+    W_CUR_FUND_CD     VARCHAR2(100);
 
 BEGIN
     WA_BF_YMD := FIMS.F_BF_YONG_YMD(P_GIJUN_YMD);
 
     FOR D1 IN (
         SELECT YMD, BF_YONG_YMD
-             , (SELECT Count(*) FROM TSS002 WHERE YMD > WA_BF_YMD AND YMD <= P_GIJUN_YMD) DAY_CNT
           FROM  FIMS.TSS002
          WHERE  YMD = P_GIJUN_YMD
            AND HUIL_GB ='0'
            ) LOOP
+
+      W_T36_PRD.DELETE;
 
       FOR F1 IN (
                 SELECT SEOLJ_YMD, FROM_YMD
@@ -48,9 +63,16 @@ BEGIN
                                 WHEN A.FUND_TYPE_GB = 'F' AND A.FROM_YMD >= A.FUND_SEOLJ_YMD THEN A.FROM_YMD
                                 WHEN A.FUND_TYPE_GB = 'I' THEN CAST(NULL AS VARCHAR2(8))  -- ★① 외곽에서 FROM_YMD 기반으로 휴일보정
                                 WHEN A.FUND_TYPE_GB IN ('A','B','C')                       -- 설정 시점의 이율로 고정하여 가져오는 관계로 해당 TYPE만
-                                    AND NOT EXISTS (SELECT 1 FROM TDO001R R                -- FROM_YMD가 실제 재구성 승인일이 아니면
-                                                      WHERE R.PRD_CD   = A.PRD_CD           --  (PRD_CD + APRV_YMD만 매칭, FUND_CD 무관)
-                                                        AND R.APRV_YMD = A.FROM_YMD) THEN
+                                    AND NOT EXISTS (SELECT 1 FROM TDO001R R                -- 직전 이력 FROM_YMD 이후 ~ 현 FROM_YMD 사이에 승인(리밸런싱)이 없으면
+                                                      WHERE R.PRD_CD    = A.PRD_CD          --  (FROM_YMD 는 자료 미입수 등으로 APRV_YMD 보다 늦을 수 있음)
+                                                        AND R.APRV_YMD <= A.FROM_YMD
+                                                        AND R.APRV_YMD >  NVL((SELECT MAX(P.FROM_YMD)
+                                                                                 FROM TDO001 P
+                                                                                WHERE P.PRD_CD    = A.PRD_CD
+                                                                                  AND P.SEOLJ_YMD = A.SEOLJ_YMD
+                                                                                  AND NVL(P.PYUNGA_GB,'Y') = 'Y'
+                                                                                  AND NVL(P.HAEJI_YMD,'99999999') >= D1.YMD
+                                                                                  AND P.FROM_YMD  < A.FROM_YMD), '00000000')) THEN
                                     NVL( (SELECT MAX(P.FROM_YMD)
                                             FROM TDO001 P
                                             WHERE P.PRD_CD    = A.PRD_CD
@@ -83,25 +105,52 @@ BEGIN
                     ) A
               WHERE A.END_YMD = (SELECT /*+ INDEX(TDO001 TDO001_SK) */ MIN(END_YMD) FROM TDO001 WHERE PRD_CD= A.PRD_CD AND END_YMD >= D1.YMD)
       ) LOOP
---DBMS_OUTPUT.PUT_LINE(D1.YMD|| ' | ' || F1.PRD_CD );
-        /* 리밸런싱 미적용시 예금 */
+        W_CUR_PRD_CD  := F1.PRD_CD;
+        W_CUR_FUND_CD := F1.FUND_CD;
+
+        /* 모든 분기가 동일 키를 재생성하므로 1회만 삭제 */
+        DELETE  TDO201
+         WHERE GIJUN_YMD = D1.YMD
+           AND PRD_CD = F1.PRD_CD
+           AND PRVD_CD = F1.PRVD_CD
+           AND RISK_GB = F1.RISK_GB
+           AND FUND_CD = F1.FUND_CD;
+
+        /* 예금 */
         IF F1.FUND_TYPE_GB IN ('A', 'B', 'C')  THEN
 
-            BEGIN
-                SELECT Decode(F_HUIL_GB(FUND_TO_YMD), 1, FIMS.F_AF_YONG_YMD(FUND_TO_YMD), FUND_TO_YMD)
-                  INTO W_T36_YMD
+            -- 펀드별 변수 초기화 (이전 루프 값 잔존 방지)
+            W_PRD_GB       := NULL;
+            W_FIX_MAT_RT   := NULL;
+            W_DAILY_RT     := 1;
+            W_T36_JY_YMD   := NULL;
+            W_T36_GB       := 'N';
+            W_RATE_YMD     := F1.UY_YMD;
+            W_CYC_FROM_YMD := F1.UY_YMD;
+
+            /* 3년 만기 주기 추적 : UY_YMD → 만기일 → 만기 익영업일(새 주기 시작) → 만기일 ...
+               D1 이전에 도래한 가장 최근 만기의 익영업일을 이율 기준일로 사용 */
+            FOR N IN 1 .. 30 LOOP
+                EXIT WHEN W_CYC_FROM_YMD IS NULL;
+
+                SELECT MIN(Decode(F_HUIL_GB(FUND_TO_YMD), 1, FIMS.F_AF_YONG_YMD(FUND_TO_YMD), FUND_TO_YMD))
+                  INTO W_MAT_YMD
                   FROM NNN.TSS003
-                WHERE CHURI_YMD BETWEEN WA_BF_YMD AND D1.YMD
-                  AND FUND_FROM_YMD = F1.UY_YMD
-                  AND GUBUN     = 'T'
-                  AND TERM      = '36';
+                 WHERE FUND_FROM_YMD = W_CYC_FROM_YMD
+                   AND GUBUN     = 'T'
+                   AND TERM      = '36';
 
-            EXCEPTION
-                WHEN NO_DATA_FOUND THEN W_T36_YMD := NULL;   -- 미존재 시 기존 동작 유지
-            END;
+                EXIT WHEN W_MAT_YMD IS NULL OR W_MAT_YMD > D1.YMD;
 
-            W_T36_GB := CASE WHEN W_T36_YMD = D1.YMD THEN 'Y' ELSE 'N' END; -- 36개월 만기 구분
-            W_T36_JY_YMD := FIMS.F_AF_YONG_YMD(W_T36_YMD); -- 만기후 이자 적용일
+                IF W_MAT_YMD = D1.YMD THEN          -- 오늘이 만기일 (이자는 익영업일부터 신규 적용)
+                    W_T36_GB := 'Y';
+                    EXIT;
+                END IF;
+
+                W_T36_JY_YMD   := FIMS.F_AF_YONG_YMD(W_MAT_YMD);   -- 만기 익영업일 (<= D1)
+                W_RATE_YMD     := W_T36_JY_YMD;
+                W_CYC_FROM_YMD := W_T36_JY_YMD;                    -- 새 주기 시작일 = 만기 익영업일
+            END LOOP;
 
             BEGIN
               SELECT TOT_PYUNGA_AEK, SEOLJ_AEK
@@ -117,8 +166,11 @@ BEGIN
                 W_SEOLJ_AEK := 0;
             END;
 
+            -- 이자 일수는 항상 전영업일 익일 ~ 당일 (휴일 포함). 운용개시일 당일만 당일 1일
+            W_DAY_FROM_YMD := CASE WHEN D1.YMD = F1.UY_YMD THEN NNN.F_BF_YONG_YMD(F1.UY_YMD) ELSE WA_BF_YMD END;
+
             BEGIN
-            SELECT PRD_GB, SUM(DAILY_RT)+1, Decode(Max(Nvl(FIX_MAT_RT,'0')), '0', Max(LNK_RT))
+            SELECT PRD_GB, SUM(DAILY_RT)+1, Decode(Max(Nvl(FIX_MAT_RT, 0)), 0, Max(LNK_RT), Max(FIX_MAT_RT))
               INTO W_PRD_GB, W_DAILY_RT, W_FIX_MAT_RT
               FROM (
                     SELECT B.FUND_CD, B.PRD_GB
@@ -127,37 +179,31 @@ BEGIN
                         , Max(FIX_MAT_RT) FIX_MAT_RT
                         , Max(LNK_RT) LNK_RT
                     FROM TSS002 A, TDO101N1 B
-                    WHERE A.YMD > Decode(D1.YMD, (CASE WHEN W_T36_JY_YMD <= D1.YMD THEN W_T36_JY_YMD ELSE F1.UY_YMD END), NNN.F_BF_YONG_YMD((CASE WHEN W_T36_JY_YMD <= D1.YMD THEN W_T36_JY_YMD ELSE F1.UY_YMD END)), WA_BF_YMD)
+                    WHERE A.YMD >  W_DAY_FROM_YMD
                     AND  A.YMD <= D1.YMD
                     AND  B.FUND_CD = F1.FUND_CD
                     AND  B.USE_YN = 'Y'
-                    AND  B.GIJUN_YM = Nvl((SELECT MAX(GIJUN_YM) FROM TDO101N1 WHERE FUND_CD = F1.FUND_CD AND GIJUN_YM <= (CASE WHEN W_T36_JY_YMD <= D1.YMD THEN W_T36_JY_YMD ELSE F1.UY_YMD END) AND USE_YN ='Y' AND (NVL(FIX_MAT_RT, 0) > 0 OR NVL(LNK_RT, 0) > 0)), (SELECT MIN(GIJUN_YM) FROM TDO101N1 WHERE FUND_CD= F1.FUND_CD AND USE_YN ='Y' AND (NVL(FIX_MAT_RT, 0) > 0 OR NVL(LNK_RT, 0) > 0)))
+                    AND  B.GIJUN_YM = Nvl((SELECT MAX(GIJUN_YM) FROM TDO101N1 WHERE FUND_CD = F1.FUND_CD AND GIJUN_YM <= W_RATE_YMD AND USE_YN ='Y' AND (NVL(FIX_MAT_RT, 0) > 0 OR NVL(LNK_RT, 0) > 0)), (SELECT MIN(GIJUN_YM) FROM TDO101N1 WHERE FUND_CD= F1.FUND_CD AND USE_YN ='Y' AND (NVL(FIX_MAT_RT, 0) > 0 OR NVL(LNK_RT, 0) > 0)))
                     GROUP BY FUND_CD, DAILY_RT, PRD_GB
                     )
             GROUP BY FUND_CD, PRD_GB;
             EXCEPTION WHEN  NO_DATA_FOUND  THEN
-                W_DAILY_RT := 0;
+                W_PRD_GB     := NULL;
+                W_DAILY_RT   := 1;        -- 이율 미존재 시 평가액 유지 (0 이면 평가액이 0 이 됨)
+                W_FIX_MAT_RT := NULL;
             END;
 
+            IF W_T36_JY_YMD = D1.YMD THEN
+                W_SEOLJ_AEK := W_BF_PYUNGA_AEK;  -- 3년 만기 익영업일 : 전일 평가액을 설정액으로 재설정
+            END IF;
 
+            IF W_PRD_GB IN ('A','B','E') THEN
+                W_PYUNGA_AEK := W_SEOLJ_AEK * (W_DAILY_RT-1) + W_BF_PYUNGA_AEK;   /* 단리 */
+            ELSE
+                W_PYUNGA_AEK := W_BF_PYUNGA_AEK * W_DAILY_RT;                       /* 복리 */
+            END IF;
 
-              IF W_PRD_GB IN ('A','B','E') /* 단리 */ AND W_T36_JY_YMD <> D1.YMD THEN
-                 W_PYUNGA_AEK := W_SEOLJ_AEK * (W_DAILY_RT-1) + W_BF_PYUNGA_AEK;
-              ELSIF W_PRD_GB IN ('A','B','E') /* 단리 */ AND W_T36_JY_YMD = D1.YMD THEN
-                 W_PYUNGA_AEK := W_BF_PYUNGA_AEK * (W_DAILY_RT-1) + W_BF_PYUNGA_AEK;
-              ELSE
-                 W_PYUNGA_AEK := W_BF_PYUNGA_AEK * W_DAILY_RT; /* 복리 */
-              END IF;
-              W_BF_PYUNGA_AEK := W_PYUNGA_AEK;
-  --DBMS_OUTPUT.PUT_LINE(D1.YMD|| ' | ' || F1.fund_CD || ' | ' ||W_SEOLJ_AEK );
                 IF F1.UY_YMD = D1.YMD AND F1.FST_SEOLJ_YN = 'Y' THEN  -- 최초 운용 개시일 (운용지시일 익영업일)
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND FUND_CD = F1.FUND_CD;
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -195,77 +241,7 @@ BEGIN
                       , P_IP_USER, SYSDATE
                     );
 
-                ELSIF W_T36_JY_YMD = D1.YMD THEN  -- 3년 만기 금리 적용일 . 만기 익영업일로 요청하여 수정
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND FUND_CD = F1.FUND_CD;
-
-                    INSERT INTO TDO201 (
-                        GIJUN_YMD
-                      , RISK_GB
-                      , PRVD_CD
-                      , PRD_CD
-                      , FUND_CD
-                      , SILH_SUIK_RT
-                      , FUND_WT
-                      , TOT_PYUNGA_AEK
-                      , SILJ_PYUNGA_AEK
-                      , NON_PYUNGA_AEK
-                      , YESU_AEK
-                      , ADJ_PYUNGA_AEK
-                      , SEOLJ_AEK
-                      , IL_BOSU
-                      , NUJ_BOSU
-                      , IP_USER, IP_DATE)
-                    SELECT D1.YMD
-                         , F1.RISK_GB
-                         , F1.PRVD_CD
-                         , F1.PRD_CD
-                         , F1.FUND_CD
-                         , W_DAILY_RT SILH_SUIK_RT
-                         , F1.FUND_WT
-                         , W_PYUNGA_AEK AS TOT_PYUNGA_AEK
-                         , W_PYUNGA_AEK AS SILJ_PYUNGA_AEK
-                         , 0 AS NON_PYUNGA_AEK
-                         , 0 AS YESU_AEK
-                         , 0 AS ADJ_PYUNGA_AEK
-                         , A.TOT_PYUNGA_AEK
-                         , 0 AS IL_BOSU
-                         , 0 AS NUJ_BOSU
-                         , P_IP_USER, SYSDATE
-                    FROM TDO201 A
-                   WHERE GIJUN_YMD = WA_BF_YMD
-                     AND PRD_CD = F1.PRD_CD
-                     AND PRVD_CD = F1.PRVD_CD
-                     AND RISK_GB = F1.RISK_GB
-                     AND FUND_CD = F1.FUND_CD
-                    ;
-
-                    UPDATE TDO001 A  -- 기본정보 REM 3년 만기 (재처리 시 최신값으로 갱신, 멱등)
-                      SET REM = TRIM(
-                                  REGEXP_REPLACE(
-                                      NVL(A.REM, ' '),
-                                      ' 3년 만기\(' || D1.YMD || '\)[^/]*/',   -- 같은 날짜 기존 문구 제거
-                                      ''
-                                  )
-                                ) || ' 3년 만기(' || D1.YMD || ') : ' || W_FIX_MAT_RT || '% /'
-                    WHERE A.FUND_CD = F1.FUND_CD
-                      AND A.END_YMD = (SELECT /*+ INDEX(TDO001 TDO001_SK) */ MIN(END_YMD)
-                                          FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= D1.YMD);
-
-
-                ELSIF F1.RBC_YMD = D1.YMD THEN  -- 리밸런싱 매도 적용일
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND FUND_CD = F1.FUND_CD;
+                ELSIF F1.RBC_YMD = D1.YMD THEN  -- 리밸런싱 매도 적용일 (3년 만기와 겹치면 리밸런싱 우선)
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -308,14 +284,68 @@ BEGIN
                      AND FUND_CD = '000'
                     ;
 
-                ELSE
+                ELSIF W_T36_JY_YMD = D1.YMD THEN  -- 3년 만기 금리 적용일 (만기 익영업일) : 설정액 재산출
 
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND FUND_CD = F1.FUND_CD;
+                    INSERT INTO TDO201 (
+                        GIJUN_YMD
+                      , RISK_GB
+                      , PRVD_CD
+                      , PRD_CD
+                      , FUND_CD
+                      , SILH_SUIK_RT
+                      , FUND_WT
+                      , TOT_PYUNGA_AEK
+                      , SILJ_PYUNGA_AEK
+                      , NON_PYUNGA_AEK
+                      , YESU_AEK
+                      , ADJ_PYUNGA_AEK
+                      , SEOLJ_AEK
+                      , IL_BOSU
+                      , NUJ_BOSU
+                      , IP_USER, IP_DATE)
+                    SELECT D1.YMD
+                         , F1.RISK_GB
+                         , F1.PRVD_CD
+                         , F1.PRD_CD
+                         , F1.FUND_CD
+                         , W_DAILY_RT SILH_SUIK_RT
+                         , F1.FUND_WT
+                         , W_PYUNGA_AEK AS TOT_PYUNGA_AEK
+                         , W_PYUNGA_AEK AS SILJ_PYUNGA_AEK
+                         , 0 AS NON_PYUNGA_AEK
+                         , 0 AS YESU_AEK
+                         , 0 AS ADJ_PYUNGA_AEK
+                         , A.TOT_PYUNGA_AEK
+                         , 0 AS IL_BOSU
+                         , 0 AS NUJ_BOSU
+                         , P_IP_USER, SYSDATE
+                    FROM TDO201 A
+                   WHERE GIJUN_YMD = WA_BF_YMD
+                     AND PRD_CD = F1.PRD_CD
+                     AND PRVD_CD = F1.PRVD_CD
+                     AND RISK_GB = F1.RISK_GB
+                     AND FUND_CD = F1.FUND_CD
+                    ;
+
+                    IF SQL%ROWCOUNT > 0 THEN
+                        W_T36_PRD(F1.PRD_CD) := 'Y';   -- 000 설정액 재산출 대상
+                    END IF;
+
+                    UPDATE TDO001 A  -- 기본정보 REM 3년 만기 (재처리 시 최신값으로 갱신, 멱등)
+                      SET REM = TRIM(
+                                  REGEXP_REPLACE(
+                                      NVL(A.REM, ' '),
+                                      ' 3년 만기\(' || D1.YMD || '\)[^/]*/',   -- 같은 날짜 기존 문구 제거
+                                      ''
+                                  )
+                                ) || ' 3년 만기(' || D1.YMD || ') : '
+                                  || RTRIM(TO_CHAR(W_FIX_MAT_RT, 'FM99999990.999999999999'), '.') || '% /'
+                    WHERE A.PRD_CD  = F1.PRD_CD
+                      AND A.FUND_CD = F1.FUND_CD
+                      AND A.END_YMD = (SELECT /*+ INDEX(TDO001 TDO001_SK) */ MIN(END_YMD)
+                                          FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= D1.YMD);
+
+                ELSE
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -349,7 +379,7 @@ BEGIN
                          , 0 AS YESU_AEK
                          , 0 AS ADJ_PYUNGA_AEK
                          , A.SEOLJ_AEK
-                         , Decode(W_T36_GB, 'Y', W_T36_GB, NULL) DEPOSIT_3Y
+                         , Decode(W_T36_GB, 'Y', W_T36_GB, NULL) DEPOSIT_3Y   -- 3년 만기일 표시
                          , 0 AS IL_BOSU
                          , 0 AS NUJ_BOSU
                          , P_IP_USER, SYSDATE
@@ -361,43 +391,44 @@ BEGIN
                      AND FUND_CD = F1.FUND_CD
                     ;
                 END IF;
-        /* 리밸런싱 미적용시 보험펀드 */
+
+        /* 보험펀드 */
         ELSIF F1.FUND_TYPE_GB = 'I'  THEN
 
-            FOR T2 IN (
-                        /* 보험펀드가 영업일에 수집되지 않는 경우가 있어 보완 */
-                       SELECT D1.YMD
-                            , F1.FUND_CD
-                            , Max(A.GIJUN_GA) AS GIJUN_GA
-                            , Nvl(Max(A.GIJUN_GA) / Max(B.GIJUN_GA), 1) AS DAILY_RT
-                        FROM TDO101N2 A
-                        LEFT JOIN TDO101N2 B
-                          ON A.FUND_CD = B.FUND_CD
-                        AND B.GIJUN_YMD = WA_BF_YMD
-                        WHERE A.FUND_CD = F1.FUND_CD
-                          AND A.GIJUN_YMD = D1.YMD
+            /* 보험펀드가 영업일에 수집되지 않는 경우가 있어 보완
+               - 당일 기준가가 없으면 직전 기준가를 이월하고 수익률 1
+               - 수익률 분모는 전일 TDO201 에 이월된 기준가를 사용하여 미수집 구간 수익률이 누락되지 않도록 함 */
+            SELECT MAX(GIJUN_GA)
+              INTO W_GA_TODAY
+              FROM TDO101N2
+             WHERE FUND_CD = F1.FUND_CD
+               AND GIJUN_YMD = D1.YMD;
 
-                        UNION ALL
+            BEGIN
+                SELECT GIJUN_GA
+                  INTO W_GA_PREV
+                  FROM TDO201
+                 WHERE GIJUN_YMD = WA_BF_YMD
+                   AND PRD_CD = F1.PRD_CD
+                   AND RISK_GB = F1.RISK_GB
+                   AND PRVD_CD = F1.PRVD_CD
+                   AND FUND_CD = F1.FUND_CD;
+            EXCEPTION WHEN NO_DATA_FOUND THEN
+                W_GA_PREV := NULL;
+            END;
 
-                        SELECT D1.YMD
-                            , F1.FUND_CD
-                            , B.GIJUN_GA
-                            , 1 AS DAILY_RT
-                        FROM TDO101N2 B
-                        WHERE B.FUND_CD = F1.FUND_CD
-                          AND B.GIJUN_YMD = WA_BF_YMD
-                          AND NOT EXISTS (SELECT 1 FROM TDO101N2 A WHERE A.FUND_CD = B.FUND_CD AND A.GIJUN_YMD = D1.YMD)
-                        ) LOOP
+            IF W_GA_PREV IS NULL THEN
+                SELECT MAX(GIJUN_GA) KEEP (DENSE_RANK LAST ORDER BY GIJUN_YMD)
+                  INTO W_GA_PREV
+                  FROM TDO101N2
+                 WHERE FUND_CD = F1.FUND_CD
+                   AND GIJUN_YMD < D1.YMD;
+            END IF;
 
+            W_GA_CUR := NVL(W_GA_TODAY, W_GA_PREV);
+            W_I_RT   := CASE WHEN W_GA_TODAY IS NOT NULL AND W_GA_PREV > 0 THEN W_GA_TODAY / W_GA_PREV ELSE 1 END;
 
-                IF D1.YMD < F1.UY_YMD AND F1.FST_SEOLJ_YN ='Y' THEN  -- 최초 운용 개시일
---DBMS_OUTPUT.PUT_LINE(D1.YMD|| ' | ' || F1.PRD_CD );
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = T2.FUND_CD;
+                IF D1.YMD < F1.UY_YMD AND F1.FST_SEOLJ_YN ='Y' THEN  -- 최초 운용 개시 이전
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -424,7 +455,7 @@ BEGIN
                       , F1.PRVD_CD
                       , F1.PRD_CD
                       , F1.FUND_CD
-                      , T2.GIJUN_GA
+                      , W_GA_CUR
                       , 1
                       , F1.FUND_WT
                       , XCON_GIJUN_AMT * F1.FUND_WT
@@ -438,13 +469,6 @@ BEGIN
                       , P_IP_USER, SYSDATE
                     );
                 ELSIF  D1.YMD = F1.UY_YMD AND F1.FST_SEOLJ_YN ='Y' THEN  -- 최초 운용 개시일
---DBMS_OUTPUT.PUT_LINE(D1.YMD|| ' | ' || F1.PRD_CD );
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = T2.FUND_CD;
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -471,7 +495,7 @@ BEGIN
                       , F1.PRVD_CD
                       , F1.PRD_CD
                       , F1.FUND_CD
-                      , T2.GIJUN_GA
+                      , W_GA_CUR
                       , 1
                       , F1.FUND_WT
                       , XCON_GIJUN_AMT * F1.FUND_WT
@@ -487,19 +511,13 @@ BEGIN
 
                 ELSIF F1.RBC_YMD = D1.YMD THEN -- 리밸런싱 적용시작일
 
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = T2.FUND_CD;
-
                     INSERT INTO TDO201 (
                         GIJUN_YMD
                       , RISK_GB
                       , PRVD_CD
                       , PRD_CD
                       , FUND_CD
+                      , GIJUN_GA
                       , SILH_SUIK_RT
                       , FUND_WT
                       , TOT_PYUNGA_AEK
@@ -517,6 +535,7 @@ BEGIN
                       , F1.PRVD_CD
                       , F1.PRD_CD
                       , F1.FUND_CD
+                      , W_GA_CUR          -- 익일 수익률 분모로 사용
                       , 1
                       , F1.FUND_WT
                       , TOT_PYUNGA_AEK * F1.FUND_WT
@@ -537,13 +556,6 @@ BEGIN
                     ;
 
                 ELSE
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = F1.FUND_CD;
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -569,12 +581,12 @@ BEGIN
                          , F1.PRVD_CD
                          , F1.PRD_CD
                          , F1.FUND_CD
-                         , T2.GIJUN_GA
+                         , W_GA_CUR
                          , NULL AS SUJ_GIJUN_GA
-                         , T2.DAILY_RT
+                         , W_I_RT
                          , F1.FUND_WT
-                         , TOT_PYUNGA_AEK * T2.DAILY_RT AS TOT_PYUNGA_AEK
-                         , SILJ_PYUNGA_AEK * T2.DAILY_RT AS SILJ_PYUNGA_AEK
+                         , TOT_PYUNGA_AEK * W_I_RT AS TOT_PYUNGA_AEK
+                         , SILJ_PYUNGA_AEK * W_I_RT AS SILJ_PYUNGA_AEK
                          , 0 AS NON_PYUNGA_AEK
                          , 0 AS YESU_AEK
                          , 0 AS ADJ_PYUNGA_AEK
@@ -590,18 +602,10 @@ BEGIN
                      AND FUND_CD = F1.FUND_CD
                     ;
                 END IF;
-            END LOOP;  -- T2
 
         ELSIF F1.FUND_TYPE_GB = 'F' THEN --펀드
 
                 IF F1.UY_YMD > D1.YMD AND F1.FST_SEOLJ_YN = 'Y'  THEN  -- 운용시작일실제평가액편입 (설정이전)
---                 DBMS_OUTPUT.PUT_LINE(D1.YMD|| ' | ' || F1.PRD_CD );
-                     DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = F1.FUND_CD;
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -644,14 +648,7 @@ BEGIN
                       ;
 
                 ELSIF F1.UY_YMD = D1.YMD  AND F1.FST_SEOLJ_YN = 'Y'  THEN  -- 운용시작일실제평가액편입 (최초)
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = F1.FUND_CD;
-
+                                                                              -- 기준가 미입수 시에도 비평가액으로 편입 (누락 방지)
                     INSERT INTO TDO201 (
                         GIJUN_YMD
                       , RISK_GB
@@ -671,36 +668,31 @@ BEGIN
                       , IL_BOSU
                       , NUJ_BOSU
                       , IP_USER, IP_DATE)
-                    SELECT GIJUN_YMD
+                    SELECT D1.YMD
                       , F1.RISK_GB
                       , F1.PRVD_CD
                       , F1.PRD_CD
                       , F1.FUND_CD
                       , A.GIJUN_GA
-                      , A.SUIK_JISU * (SELECT FST_GIJUN_GA FROM TFN001 WHERE ZEROIN_TYPE_GB ='A2' AND END_YMD ='99999999' AND FUND_CD = A.FUND_CD) AS SUJ_GIJUN_GA
+                      , A.SUIK_JISU * (SELECT FST_GIJUN_GA FROM TFN001 WHERE ZEROIN_TYPE_GB ='A2' AND END_YMD ='99999999' AND FUND_CD = F1.FUND_CD) AS SUJ_GIJUN_GA
                       , A.SILH_SUIK_RT
                       , F1.FUND_WT
                       , XCON_GIJUN_AMT * F1.FUND_WT AS TOT_PYUNGA_AEK
-                      , XCON_GIJUN_AMT * F1.FUND_WT AS SILJ_PYUNGA_AEK
-                      , 0 AS NON_PYUNGA_AEK
+                      , CASE WHEN A.GIJUN_GA IS NULL THEN 0 ELSE XCON_GIJUN_AMT * F1.FUND_WT END AS SILJ_PYUNGA_AEK
+                      , CASE WHEN A.GIJUN_GA IS NULL THEN XCON_GIJUN_AMT * F1.FUND_WT ELSE 0 END AS NON_PYUNGA_AEK
                       , 0 AS YESU_AEK
                       , 0 AS ADJ_PYUNGA_AEK
                       , XCON_GIJUN_AMT * F1.FUND_WT AS SEOLJ_AEK
                       , 0
                       , 0
-                      , P_IP_USER, SYSDATE  FROM TFN201 A
-                    WHERE ZEROIN_TYPE_GB = 'A2'
-                      AND GIJUN_YMD = D1.YMD
-                      AND FUND_CD = F1.FUND_CD;
+                      , P_IP_USER, SYSDATE
+                      FROM DUAL
+                      LEFT OUTER JOIN TFN201 A
+                        ON A.ZEROIN_TYPE_GB = 'A2'
+                       AND A.GIJUN_YMD = D1.YMD
+                       AND A.FUND_CD = F1.FUND_CD;
 
-                ELSIF D1.YMD = F1.RBC_YMD THEN  --  최초 적용일 비평가액으로 산입(리밸런싱)
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = F1.FUND_CD;
+                ELSIF D1.YMD = F1.RBC_YMD THEN  --  최초 적용일 (리밸런싱) : 기준가 미입수 시 비평가액으로 산입
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -727,91 +719,30 @@ BEGIN
                       , F1.PRD_CD
                       , F1.FUND_CD
                       , A.GIJUN_GA
-                      , A.SUIK_JISU * (SELECT FST_GIJUN_GA FROM TFN001 WHERE ZEROIN_TYPE_GB ='A2' AND END_YMD ='99999999' AND FUND_CD = A.FUND_CD) AS SUJ_GIJUN_GA
+                      , A.SUIK_JISU * (SELECT FST_GIJUN_GA FROM TFN001 WHERE ZEROIN_TYPE_GB ='A2' AND END_YMD ='99999999' AND FUND_CD = F1.FUND_CD) AS SUJ_GIJUN_GA
                       , A.SILH_SUIK_RT
                       , F1.FUND_WT
                       , B.TOT_PYUNGA_AEK * F1.FUND_WT  AS TOT_PYUNGA_AEK
-                      , B.TOT_PYUNGA_AEK * F1.FUND_WT AS SILJ_PYUNGA_AEK
-                      , 0 AS NON_PYUNGA_AEK
+                      , CASE WHEN A.GIJUN_GA IS NULL THEN 0 ELSE B.TOT_PYUNGA_AEK * F1.FUND_WT END AS SILJ_PYUNGA_AEK
+                      , CASE WHEN A.GIJUN_GA IS NULL THEN B.TOT_PYUNGA_AEK * F1.FUND_WT ELSE 0 END AS NON_PYUNGA_AEK
                       , 0 AS YESU_AEK
                       , 0 AS ADJ_PYUNGA_AEK
                       , B.TOT_PYUNGA_AEK * F1.FUND_WT AS SEOLJ_AEK
                       , 0
                       , 0
-                      , P_IP_USER, SYSDATE  FROM TFN201 A, TDO201 B
-                    WHERE A.ZEROIN_TYPE_GB = 'A2'
-                      AND A.GIJUN_YMD = D1.YMD
-                      AND A.FUND_CD = F1.FUND_cD
-                      AND B.PRD_CD = F1.PRD_CD
+                      , P_IP_USER, SYSDATE
+                      FROM TDO201 B
+                      LEFT OUTER JOIN TFN201 A
+                        ON A.ZEROIN_TYPE_GB = 'A2'
+                       AND A.GIJUN_YMD = D1.YMD
+                       AND A.FUND_CD = F1.FUND_CD
+                    WHERE B.PRD_CD = F1.PRD_CD
                       AND B.RISK_GB = F1.RISK_GB
                       AND B.PRVD_CD = F1.PRVD_CD
-                      AND B.FUND_cD = '000'
-                      AND B.GIJUN_YMD = FIMS.F_BF_YONG_YMD(F1.FROM_YMD);
+                      AND B.FUND_CD = '000'
+                      AND B.GIJUN_YMD = WA_BF_YMD;       -- FROM_YMD 는 APRV_YMD 와 다를 수 있으므로 전영업일 기준
 
-                ELSIF D1.YMD = FIMS.F_AF_YONG_YMD(F1.UY_YMD)  THEN  --  실제 평가 시작 수익률 반영
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = F1.FUND_CD;
-                    INSERT INTO TDO201 (
-                        GIJUN_YMD
-                      , RISK_GB
-                      , PRVD_CD
-                      , PRD_CD
-                      , FUND_CD
-                      , GIJUN_GA
-                      , SUJ_GIJUN_GA
-                      , SILH_SUIK_RT
-                      , FUND_WT
-                      , TOT_PYUNGA_AEK
-                      , SILJ_PYUNGA_AEK
-                      , NON_PYUNGA_AEK
-                      , YESU_AEK
-                      , ADJ_PYUNGA_AEK
-                      , SEOLJ_AEK
-                      , IL_BOSU
-                      , NUJ_BOSU
-                      , IP_USER, IP_DATE)
-                    SELECT
-                        A.GIJUN_YMD
-                      , F1.RISK_GB
-                      , F1.PRVD_CD
-                      , F1.PRD_CD
-                      , F1.FUND_CD
-                      , A.GIJUN_GA
-                      , A.SUIK_JISU * (SELECT FST_GIJUN_GA FROM TFN001 WHERE ZEROIN_TYPE_GB ='A2' AND END_YMD ='99999999' AND FUND_CD = A.FUND_CD) AS SUJ_GIJUN_GA
-                      , A.SILH_SUIK_RT
-                      , F1.FUND_WT
-                      , B.TOT_PYUNGA_AEK  * A.SILH_SUIK_RT AS TOT_PYUNGA_AEK
-                      , B.SILJ_PYUNGA_AEK * A.SILH_SUIK_RT AS SILJ_PYUNGA_AEK
-                      , 0 AS NON_PYUNGA_AEK
-                      , 0 AS YESU_AEK
-                      , 0 AS ADJ_PYUNGA_AEK
-                      , B.SEOLJ_AEK  AS SEOLJ_AEK
-                      , 0
-                      , 0
-                      , P_IP_USER, SYSDATE  FROM TFN201 A, TDO201 B
-                    WHERE A.ZEROIN_TYPE_GB = 'A2'
-                      AND A.GIJUN_YMD = D1.YMD
-                      AND A.FUND_CD = F1.FUND_cD
-                      AND B.PRD_CD = F1.PRD_CD
-                      AND B.RISK_GB = F1.RISK_GB
-                      AND B.PRVD_CD = F1.PRVD_CD
-                      AND B.FUND_cD = F1.FUND_CD
-                      AND B.GIJUN_YMD = WA_BF_YMD;
-
-                ELSE
-
-                    DELETE  TDO201
-                     WHERE GIJUN_YMD = D1.YMD
-                       AND PRD_CD = F1.PRD_CD
-                       AND RISK_GB = F1.RISK_GB
-                       AND PRVD_CD = F1.PRVD_CD
-                       AND FUND_CD = F1.FUND_CD
-                       ;
+                ELSE  -- 일반 평가 (기존 '운용개시 익영업일' 분기와 동일 결과이므로 통합)
 
                     INSERT INTO TDO201 (
                         GIJUN_YMD
@@ -832,41 +763,71 @@ BEGIN
                       , IL_BOSU
                       , NUJ_BOSU
                       , IP_USER, IP_DATE)
-
                  SELECT D1.YMD
-                      , B.RISK_GB
-                      , B.PRVD_CD
-                      , B.PRD_CD
+                      , X.RISK_GB
+                      , X.PRVD_CD
+                      , X.PRD_CD
                       , F1.FUND_CD
-                      , A.GIJUN_GA
-                      , A.SUIK_JISU * (SELECT FST_GIJUN_GA FROM TFN001 WHERE ZEROIN_TYPE_GB ='A2' AND END_YMD ='99999999' AND FUND_CD = B.FUND_CD) AS SUJ_GIJUN_GA
-                      , NVL(A.SILH_SUIK_RT, 1) AS SILH_SUIK_RT
-                      , F1.FUND_wT
-                      , NVL(B.TOT_PYUNGA_AEK * A.SILH_SUIK_RT, B.TOT_PYUNGA_AEK) AS TOT_PYUNGA_AEK
-                      , NVL(B.TOT_PYUNGA_AEK * A.SILH_SUIK_RT, 0) AS SILJ_PYUNGA_AEK
-                      , DECODE(NVL(A.GIJUN_GA, 1), 1, B.TOT_PYUNGA_AEK, 0)  AS NON_PYUNGA_AEK
+                      , NVL(X.A_GIJUN_GA, X.B_GIJUN_GA)            -- 미입수 시 기준가 이월
+                      , NVL(X.A_SUJ_GIJUN_GA, X.B_SUJ_GIJUN_GA)    -- 미입수 시 수정기준가 이월
+                      , X.RT AS SILH_SUIK_RT
+                      , F1.FUND_WT
+                      , X.B_TOT * X.RT AS TOT_PYUNGA_AEK
+                      , CASE WHEN X.A_GIJUN_GA IS NULL THEN 0 ELSE X.B_TOT * X.RT END AS SILJ_PYUNGA_AEK
+                      , CASE WHEN X.A_GIJUN_GA IS NULL THEN X.B_TOT ELSE 0 END AS NON_PYUNGA_AEK
                       , 0 AS YESU_AEK
                       , 0 AS ADJ_PYUNGA_AEK
-                      , B.SEOLJ_AEK
+                      , X.B_SEOLJ
                       , 0 AS IL_BOSU
                       , 0 AS NUJ_BOSU
                       , P_IP_USER
                       , SYSDATE
-                     FROM TDO201 B
-                     -------------------------------------------------------------
-                     LEFT OUTER JOIN TFN201 A
-                     ON A.FUND_CD = B.FUND_CD AND A.ZEROIN_TYPE_GB (+)= 'A2' AND A.GIJUN_YMD = D1.YMD
-                    WHERE B.PRVD_CD = F1.PRVD_CD
-                      AND B.RISK_GB = F1.RISK_GB
-                      AND B.GIJUN_YMD = WA_BF_YMD
-                      AND B.PRD_CD = F1.PRD_CD
-                      AND B.FUND_CD = F1.FUND_CD
+                   FROM (
+                         SELECT Y.*
+                              , CASE WHEN Y.A_GIJUN_GA IS NULL THEN 1
+                                     -- 전일이 미입수(이월)였다면 전일대비 수익률 대신 수정기준가 비율로 공백 구간 수익률 반영
+                                     WHEN Y.B_NON_PYUNGA > 0 AND Y.B_SUJ_GIJUN_GA > 0 AND Y.A_SUJ_GIJUN_GA > 0
+                                          THEN Y.A_SUJ_GIJUN_GA / Y.B_SUJ_GIJUN_GA
+                                     ELSE NVL(Y.A_SILH_SUIK_RT, 1)
+                                END AS RT
+                           FROM (
+                                 SELECT B.RISK_GB, B.PRVD_CD, B.PRD_CD
+                                      , B.TOT_PYUNGA_AEK       AS B_TOT
+                                      , B.SEOLJ_AEK            AS B_SEOLJ
+                                      , NVL(B.NON_PYUNGA_AEK, 0) AS B_NON_PYUNGA
+                                      , B.GIJUN_GA             AS B_GIJUN_GA
+                                      , B.SUJ_GIJUN_GA         AS B_SUJ_GIJUN_GA
+                                      , A.GIJUN_GA             AS A_GIJUN_GA
+                                      , A.SILH_SUIK_RT         AS A_SILH_SUIK_RT
+                                      , A.SUIK_JISU * (SELECT FST_GIJUN_GA FROM TFN001 WHERE ZEROIN_TYPE_GB ='A2' AND END_YMD ='99999999' AND FUND_CD = B.FUND_CD) AS A_SUJ_GIJUN_GA
+                                   FROM TDO201 B
+                                   LEFT OUTER JOIN TFN201 A
+                                     ON A.FUND_CD = B.FUND_CD
+                                    AND A.ZEROIN_TYPE_GB = 'A2'
+                                    AND A.GIJUN_YMD = D1.YMD
+                                  WHERE B.PRVD_CD = F1.PRVD_CD
+                                    AND B.RISK_GB = F1.RISK_GB
+                                    AND B.GIJUN_YMD = WA_BF_YMD
+                                    AND B.PRD_CD = F1.PRD_CD
+                                    AND B.FUND_CD = F1.FUND_CD
+                                ) Y
+                        ) X
                       ;
 
                 END IF;
-            COMMIT;
         END IF;
        END LOOP; -- F1
+
+       /* 재처리 시 구성에서 빠진 개별자산의 기존 행 정리 (000 합산 오염 방지) */
+       DELETE TDO201 T
+        WHERE T.GIJUN_YMD = D1.YMD
+          AND T.PRD_CD LIKE P_PRD_CD
+          AND T.FUND_CD <> '000'
+          AND NOT EXISTS (SELECT 1
+                            FROM TDO001 A
+                           WHERE A.PRD_CD  = T.PRD_CD
+                             AND A.FUND_CD = T.FUND_CD
+                             AND A.END_YMD = (SELECT MIN(END_YMD) FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= D1.YMD));
 
 --       -- 디폴트 상품 전체 그룹 수익률 생성 (000)
        FOR G1 IN (
@@ -889,7 +850,6 @@ BEGIN
                                   ELSE A.FROM_YMD
                               END AS UY_YMD
                             , (SELECT DECODE(F_HUIL_GB(MAX(APRV_YMD)), '0', MAX(APRV_YMD), FIMS.F_AF_YONG_YMD(MAX(APRV_YMD))) FROM TDO001R WHERE PRD_CD = A.PRD_CD AND APRV_YMD BETWEEN WA_BF_YMD AND D1.YMD GROUP BY PRD_CD) AS RBC_YMD -- 리밸런싱 여부
-                            , (SELECT DEPOSIT_3Y FROM TDO201 WHERE PRD_CD = A.PRD_CD AND GIJUN_YMD = D1.YMD AND FUND_cD = A.FUND_CD) AS T36_GB
                         FROM TDO001 A
                         WHERE A.SEOLJ_YMD = (SELECT MAX(SEOLJ_YMD) FROM TDO001 WHERE PRD_CD = A.PRD_CD AND SEOLJ_YMD <= D1.YMD)
                           AND NVL(A.HAEJI_YMD,'99999999') >= D1.YMD
@@ -910,7 +870,6 @@ BEGIN
                         , PRD_CD
                         , NVL(MAX(RBC_YMD), '99999999') AS RBC_YMD
                         , MAX(FST_SEOLJ_YN) AS FST_SEOLJ_YN
-                        , NVL(MAX(T36_GB), 'N') AS T36_GB
 --                        , SUM(ADJ_FUND_WT)  AS FUND_WT   -- ★★ 기준일에 유효한 비중만 합산
                         , CASE WHEN MAX(FST_SEOLJ_YN) = 'Y'
                               THEN XCON_GIJUN_AMT
@@ -926,17 +885,19 @@ BEGIN
                     WHERE A.END_YMD = (SELECT MIN(END_YMD)FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= D1.YMD)
                     GROUP BY PRD_CD
                   ) LOOP
-       BEGIN
-       --
+          W_CUR_PRD_CD  := G1.PRD_CD;
+          W_CUR_FUND_CD := G1.FUND_CD;
+
+          DELETE  TDO201
+            WHERE GIJUN_YMD = D1.YMD
+              AND PRD_CD = G1.PRD_CD
+              AND RISK_GB = G1.RISK_GB
+              AND PRVD_CD = G1.PRVD_CD
+              AND FUND_CD = G1.FUND_CD
+              ;
+
           IF  D1.YMD = G1.FROM_YMD AND G1.FST_SEOLJ_YN = 'Y'  THEN --최초 운용지시
 
-              DELETE  TDO201
-                WHERE GIJUN_YMD = D1.YMD
-                  AND PRD_CD = G1.PRD_CD
-                  AND RISK_GB = G1.RISK_GB
-                  AND PRVD_CD = G1.PRVD_CD
-                  AND FUND_CD = G1.FUND_CD
-                  ;
               INSERT INTO TDO201 (
                   GIJUN_YMD
                 , RISK_GB
@@ -976,136 +937,28 @@ BEGIN
                 FROM DUAL
             ;
 
-          ELSIF G1.T36_GB = 'Y' THEN  -- 예금 3년만기 설정액 재산출
-
-               DELETE  TDO201
-                WHERE GIJUN_YMD = D1.YMD
-                  AND PRD_CD = G1.PRD_CD
-                  AND RISK_GB = G1.RISK_GB
-                  AND PRVD_CD = G1.PRVD_CD
-                  AND FUND_CD = G1.FUND_CD
-                  ;
-              INSERT INTO TDO201 (
-                  GIJUN_YMD
-                , RISK_GB
-                , PRVD_CD
-                , PRD_CD
-                , FUND_CD
-                , SILH_SUIK_RT
-                , SUIK_JISU
-                , FUND_WT
-                , TOT_PYUNGA_AEK
-                , SILJ_PYUNGA_AEK
-                , NON_PYUNGA_AEK
-                , YESU_AEK
-                , ADJ_PYUNGA_AEK
-                , SEOLJ_AEK
-                , IL_BOSU
-                , NUJ_BOSU
-                , IP_USER, IP_DATE)
-         SELECT D1.YMD GIJUN_YMD
-                , G1.RISK_GB
-                , G1.PRVD_CD
-                , PRD_CD
-                , G1.FUND_CD AS FUND_CD
-                , ( SUM(SILJ_PYUNGA_AEK)
-                  + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK) ) / (SELECT TOT_PYUNGA_AEK FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD) AS SILH_SUIK_RT
-                , (( SUM(SILJ_PYUNGA_AEK)
-                  + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK) ) / (SELECT TOT_PYUNGA_AEK FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD))
-                  * (SELECT SUIK_JISU FROM TDO201 WHERE GIJUN_YMD = D1.BF_YONG_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD) AS SUIK_JISU
-                , SUM(FUND_WT) AS FUND_WT
-                , ( SUM(SILJ_PYUNGA_AEK)
-                  + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK)) AS TOT_PYUNGA_AEK
-                , SUM(SILJ_PYUNGA_AEK) AS SILJ_PYUNGA_AEK
-                , SUM(NON_PYUNGA_AEK) AS NON_PYUNGA_AEK
-                , Sum(YESU_AEK) AS YESU_AEK
-                , SUM(ADJ_PYUNGA_AEK) AS ADJ_PYUNGA_AEK
-                , Sum(SEOLJ_AEK)  AS SEOLJ_AEK
-                , SUM(IL_BOSU) AS IL_BOSU
-                , SUM(NUJ_BOSU) AS NUJ_BOSU
-                , P_IP_USER AS IP_USER
-                , SYSDATE
-                FROM  TDO201
-              WHERE  GIJUN_YMD = D1.YMD
-                AND  PRD_CD = G1.PRD_CD
-                AND PRVD_CD = G1.PRVD_CD
-                AND RISK_GB = G1.RISK_GB
-                AND  FUND_CD <> G1.FUND_CD
-            GROUP BY  PRD_CD;
-
-          ELSIF D1.YMD = G1.RBC_YMD  THEN -- 리밸런싱 시작
-
-               DELETE  TDO201
-                WHERE GIJUN_YMD = D1.YMD
-                  AND PRD_CD = G1.PRD_CD
-                  AND RISK_GB = G1.RISK_GB
-                  AND PRVD_CD = G1.PRVD_CD
-                  AND FUND_CD = G1.FUND_CD
-                  ;
-              INSERT INTO TDO201 (
-                  GIJUN_YMD
-                , RISK_GB
-                , PRVD_CD
-                , PRD_CD
-                , FUND_CD
-                , SILH_SUIK_RT
-                , SUIK_JISU
-                , FUND_WT
-                , TOT_PYUNGA_AEK
-                , SILJ_PYUNGA_AEK
-                , NON_PYUNGA_AEK
-                , YESU_AEK
-                , ADJ_PYUNGA_AEK
-                , SEOLJ_AEK
-                , IL_BOSU
-                , NUJ_BOSU
-                , IP_USER, IP_DATE)
-         SELECT D1.YMD GIJUN_YMD
-                , G1.RISK_GB
-                , G1.PRVD_CD
-                , PRD_CD
-                , G1.FUND_CD AS FUND_CD
-                , ( SUM(SILJ_PYUNGA_AEK)
-                  + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK) ) / (SELECT TOT_PYUNGA_AEK FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD) AS SILH_SUIK_RT
-                , (( SUM(SILJ_PYUNGA_AEK)
-                  + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK) ) / (SELECT TOT_PYUNGA_AEK FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD))
-                  * (SELECT SUIK_JISU FROM TDO201 WHERE GIJUN_YMD = D1.BF_YONG_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD) AS SUIK_JISU
-                , SUM(FUND_WT) AS FUND_WT
-                , ( SUM(SILJ_PYUNGA_AEK)
-                  + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK)) AS TOT_PYUNGA_AEK
-                , SUM(SILJ_PYUNGA_AEK) AS SILJ_PYUNGA_AEK
-                , SUM(NON_PYUNGA_AEK) AS NON_PYUNGA_AEK
-                , Sum(YESU_AEK) AS YESU_AEK
-                , SUM(ADJ_PYUNGA_AEK) AS ADJ_PYUNGA_AEK
-                , Sum(SEOLJ_AEK)  AS SEOLJ_AEK
-                , SUM(IL_BOSU) AS IL_BOSU
-                , SUM(NUJ_BOSU) AS NUJ_BOSU
-                , P_IP_USER AS IP_USER
-                , SYSDATE
-                FROM  TDO201
-              WHERE  GIJUN_YMD = D1.YMD
-                AND  PRD_CD = G1.PRD_CD
-                AND PRVD_CD = G1.PRVD_CD
-                AND RISK_GB = G1.RISK_GB
-                AND  FUND_CD <> G1.FUND_CD
-            GROUP BY  PRD_CD
-          ;
-
           ELSE
---             DBMS_OUTPUT.PUT_LINE(D1.YMD|| ' | ' || G1.PRD_CD );
-              DELETE  TDO201
-                WHERE GIJUN_YMD = D1.YMD
-                  AND PRD_CD = G1.PRD_CD
-                  AND RISK_GB = G1.RISK_GB
-                  AND PRVD_CD = G1.PRVD_CD
-                  AND FUND_CD = G1.FUND_CD
-                  ;
+              BEGIN
+                  SELECT TOT_PYUNGA_AEK, SEOLJ_AEK, SUIK_JISU
+                    INTO W_P_TOT_AEK, W_P_SEOLJ_AEK, W_P_SUIK_JISU
+                    FROM TDO201
+                   WHERE GIJUN_YMD = WA_BF_YMD
+                     AND PRD_CD = G1.PRD_CD
+                     AND FUND_CD = G1.FUND_CD;
+              EXCEPTION WHEN NO_DATA_FOUND THEN
+                  W_P_TOT_AEK   := NULL;
+                  W_P_SEOLJ_AEK := NULL;
+                  W_P_SUIK_JISU := NULL;
+              END;
+
+              /* 000 설정액
+                 R : 리밸런싱 시작  - 재배분된 개별자산 설정액 합계
+                 T : 예금 3년 만기 이자 적용일 - 리밸런싱과 동일하게 전일 평가액으로 재설정
+                 N : 그 외         - 전일 설정액 이월 (재설정값 유지) */
+              W_000_SEOLJ_GB := CASE WHEN D1.YMD = G1.RBC_YMD          THEN 'R'
+                                     WHEN W_T36_PRD.EXISTS(G1.PRD_CD)  THEN 'T'
+                                     ELSE 'N' END;
+
               INSERT INTO TDO201 (
                   GIJUN_YMD
                 , RISK_GB
@@ -1131,11 +984,10 @@ BEGIN
                 , G1.FUND_CD AS FUND_CD
                 , ( SUM(SILJ_PYUNGA_AEK)
                   + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK) ) / (SELECT TOT_PYUNGA_AEK FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD) AS SILH_SUIK_RT
-                , (SUM(SILJ_PYUNGA_AEK)
+                  + Sum(YESU_AEK) ) / NULLIF(W_P_TOT_AEK, 0) AS SILH_SUIK_RT
+                , ( SUM(SILJ_PYUNGA_AEK)
                   + SUM(NON_PYUNGA_AEK)
-                  + Sum(YESU_AEK) ) / (SELECT TOT_PYUNGA_AEK FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD)
-                  * (SELECT SUIK_JISU FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD) AS SUIK_JISU
+                  + Sum(YESU_AEK) ) / NULLIF(W_P_TOT_AEK, 0) * W_P_SUIK_JISU AS SUIK_JISU
                 , SUM(FUND_WT) AS FUND_WT
                 , ( SUM(SILJ_PYUNGA_AEK)
                   + SUM(NON_PYUNGA_AEK)
@@ -1144,8 +996,11 @@ BEGIN
                 , SUM(NON_PYUNGA_AEK) AS NON_PYUNGA_AEK
                 , Sum(YESU_AEK) AS YESU_AEK
                 , SUM(ADJ_PYUNGA_AEK) AS ADJ_PYUNGA_AEK
-                --, (SELECT SEOLJ_AEK FROM TDO201 WHERE GIJUN_YMD = WA_BF_YMD AND FUND_CD = G1.FUND_CD AND PRD_CD = G1.PRD_CD)  AS SEOLJ_AEK
-                , Sum(SEOLJ_AEK)  AS SEOLJ_AEK
+                , CASE W_000_SEOLJ_GB
+                       WHEN 'R' THEN SUM(SEOLJ_AEK)
+                       WHEN 'T' THEN NVL(W_P_TOT_AEK, SUM(SEOLJ_AEK))
+                       ELSE          NVL(W_P_SEOLJ_AEK, SUM(SEOLJ_AEK))
+                  END AS SEOLJ_AEK
                 , SUM(IL_BOSU) AS IL_BOSU
                 , SUM(NUJ_BOSU) AS NUJ_BOSU
                 , P_IP_USER AS IP_USER
@@ -1159,12 +1014,9 @@ BEGIN
             GROUP BY  PRD_CD
             ;
           END IF;
-
-       COMMIT;
-       END;
        END LOOP;
 
-       BEGIN -- 분산값 산출
+       BEGIN -- 분산값 산출 (산식 검토 보류)
           MERGE INTO TDO201 M
           USING (
                   WITH BASE_DATA AS (
@@ -1207,12 +1059,15 @@ BEGIN
                SET M.BUNSN = U.BUNSN;
        END;
     END LOOP; -- D1
-    COMMIT;
+
+    COMMIT;   -- 기준일 단위 단일 트랜잭션
 
     P_MSG := 'Y';
 
 EXCEPTION
     WHEN OTHERS THEN
-        P_MSG := 'N - ' || SQLERRM;
+        ROLLBACK;
+        P_MSG := SUBSTR('N - [' || P_GIJUN_YMD || ' / ' || W_CUR_PRD_CD || ' / ' || W_CUR_FUND_CD || '] '
+                        || SQLERRM || ' ' || DBMS_UTILITY.FORMAT_ERROR_BACKTRACE, 1, 1000);
 END;
 /
