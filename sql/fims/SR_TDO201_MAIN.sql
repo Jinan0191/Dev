@@ -638,8 +638,9 @@ BEGIN
           END IF;
       END LOOP;
 
-       /* 재처리 시 구성에서 빠진 개별자산의 기존 행 정리 (000 합산 오염 방지)
-          리밸런싱일은 기존 구성(전영업일 기준)으로 저장하므로 두 구성 모두 유효 */
+       /* 당일 평가 구성에 없는 개별자산 행 정리 (재처리·이전 산출 잔존 행이 000 에 합산되는 것 방지)
+          - 리밸런싱일 : 기존 구성(전영업일 기준)만 유효 → 같은 날 변경 포트폴리오 행은 삭제
+          - 그 외      : 당일 구성만 유효 */
        DELETE TDO201 T
         WHERE T.GIJUN_YMD = D1.YMD
           AND T.PRD_CD LIKE P_PRD_CD
@@ -648,8 +649,15 @@ BEGIN
                             FROM TDO001 A
                            WHERE A.PRD_CD  = T.PRD_CD
                              AND A.FUND_CD = T.FUND_CD
-                             AND (   A.END_YMD = (SELECT MIN(END_YMD) FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= D1.YMD)
-                                  OR A.END_YMD = (SELECT MIN(END_YMD) FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= WA_BF_YMD)));
+                             AND A.END_YMD = (SELECT MIN(END_YMD)
+                                                FROM TDO001
+                                               WHERE PRD_CD = A.PRD_CD
+                                                 AND END_YMD >= CASE WHEN EXISTS (SELECT 1 FROM TDO001R R
+                                                                                   WHERE R.PRD_CD = A.PRD_CD
+                                                                                     AND R.APRV_YMD >  WA_BF_YMD
+                                                                                     AND R.APRV_YMD <= D1.YMD)
+                                                                     THEN WA_BF_YMD
+                                                                     ELSE D1.YMD END));
 
 --       -- 디폴트 상품 전체 그룹 수익률 생성 (000)
        FOR G1 IN (
