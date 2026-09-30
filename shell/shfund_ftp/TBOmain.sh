@@ -12,19 +12,30 @@ then
 	export YMD=${1};
 	# export YMD=$(date -d "${1}" +'%Y%m%d')
 	# export YMD=$(date -d "$YMD -1 days" +'%Y%m%d')
-else	
+else
 	export YMD=$(date +"%Y%m%d");
 	export BF_YMD=$(date +"%Y%m%d" -d '-1days');
 fi
 
 
-# ./home/rdev/R/ETL_u/bin/TBOmain.sh 
+# ./home/rdev/R/ETL_u/bin/TBOmain.sh
+# 2026.09.30 중복 실행 방지(flock), NOT READY 오판 수정, ssh 종료코드로 전송 성공 판단
 
 export RSRC_PATH='/home/rdev/R/ETL_u/src'
 export LOG_PATH='/home/rdev/R/ETL_u/log'
 export LOG_FILE="/TBOLOG."$(date +"%Y%m")
 export PROC_ID='TBOmain.sh'
 YYYYMM=$(date +"%Y%m");
+
+FTP_SERVER='fundftp@210.92.202.230'
+SSH_OPT='-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=4'
+
+# 중복 실행 방지 : 전송 중에 다시 실행되면 두 세션이 동시에 FTP 전송하게 된다.
+exec 9>$LOG_PATH/.TBOmain.lock
+if ! flock -n 9; then
+	/bin/echo "[${YMD}] TBOmain.sh ALREADY RUNNING - SKIP ------------------------------------" >> $LOG_PATH$LOG_FILE
+	exit;
+fi
 
 /bin/date "+[%Y%m%d][%H:%M:%S] [${PROC_ID}] [${YMD}]---------------------------------------------" >> $LOG_PATH$LOG_FILE
 /bin/date "+[%Y%m%d][%H:%M:%S] TBO316_make [${YMD}] start. --------------------------------------" >> $LOG_PATH$LOG_FILE
@@ -38,22 +49,28 @@ Rscript $RSRC_PATH/20.TBO316_make.R $YMD $YMD 1016 >> $LOG_PATH$LOG_FILE
 
 /bin/date "+[%Y%m%d][%H:%M:%S] TBO316_make [${YMD}] end. ----------------------------------------" >> $LOG_PATH$LOG_FILE
 
-############################################################### 
-tbo_chk=`cat $LOG_PATH$LOG_FILE |grep $YMD |grep SHFUND |wc -l`
-send_chk=`cat $LOG_PATH$LOG_FILE |grep $YMD |grep SHFUND |grep FTP |grep END |wc -l`
-if [ ${tbo_chk} -eq "0" ]; then
-        /bin/echo "[${YMD}] SHFUND NPS FILES ARE NOT READY ------------------------------------" >> $LOG_PATH$LOG_FILE
-	exit;
-elif [ ${send_chk} -gt "0" ]; then
+###############################################################
+# 이 쉘이 직접 남기는 SHFUND 메시지(NOT READY/SEND END/SEND FAIL 등)는 준비 여부 판단에서 제외
+tbo_chk=`grep "$YMD" $LOG_PATH$LOG_FILE | grep SHFUND | grep -v -e "SHFUND NPS FILES ARE NOT READY" -e "SHFUND NPS FTP" -e "SHFUND FTP" | wc -l`
+send_chk=`grep -F "[${YMD}] SHFUND NPS FTP SEND END" $LOG_PATH$LOG_FILE | wc -l`
+if [ ${send_chk} -gt 0 ]; then
 	/bin/echo "[${YMD}] SHFUND NPS FTP ALREADY SENT ---------------------------------------" >> $LOG_PATH$LOG_FILE
-	exit;	
+	exit;
+elif [ ${tbo_chk} -eq 0 ]; then
+	/bin/echo "[${YMD}] SHFUND NPS FILES ARE NOT READY ------------------------------------" >> $LOG_PATH$LOG_FILE
+	exit;
 else
 	# /bin/ssh fundftp@210.92.202.230 "/home/fundftp/bin/ftp_kebis_send.sh ${YMD}"; # 2026.01.02 하나펀드서비스 중단
-	/bin/ssh fundftp@210.92.202.230 "/home/fundftp/bin/ftp_shinhan_send.sh ${YMD}"; # 2026.01.02 신한펀드파트너스 추가
+	# 2026.01.02 신한펀드파트너스 추가
+	# 전송 스크립트가 파일별 크기/MD5 검증 결과를 표준출력으로 돌려주고, 전체 성공 시에만 종료코드 0
+	/bin/ssh ${SSH_OPT} ${FTP_SERVER} "/home/fundftp/bin/ftp_shinhan_send.sh ${YMD}" >> $LOG_PATH$LOG_FILE 2>&1
+	send_rc=$?
 
-	send_success_cnt=`/bin/ssh fundftp@210.92.202.230 "cat /home/fundftp/log/feed_log.$YYYYMM |grep $YMD |grep complete |wc -l"`
-	if [ ${send_success_cnt} -gt "0" ]; then
-			/bin/echo "[${YMD}] SHFUND NPS FTP SEND END (COUNT:${send_success_cnt})---------------------------"  >> $LOG_PATH$LOG_FILE
+	if [ ${send_rc} -eq 0 ]; then
+		/bin/echo "[${YMD}] SHFUND NPS FTP SEND END (6/6 VERIFIED)---------------------------" >> $LOG_PATH$LOG_FILE
+	else
+		# 1:검증실패 2:파일없음 3:중복실행 4:설정오류 255:ssh 접속 실패
+		/bin/echo "[${YMD}] SHFUND NPS FTP SEND FAIL (RC:${send_rc})---------------------------" >> $LOG_PATH$LOG_FILE
 	fi
 fi
 
