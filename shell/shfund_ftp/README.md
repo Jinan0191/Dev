@@ -6,15 +6,9 @@
 | ftp_shinhan_send.sh | FTP 중계 서버 (fundftp@210.92.202.230) | /home/fundftp/bin/ |
 
 ## 배포 전 준비 (FTP 중계 서버)
-FTP 접속정보를 스크립트에서 분리했으므로 설정 파일을 만들어야 한다.
-```bash
-cat > /home/fundftp/.ftp_shinhan.conf <<'CONF'
-FTP_HOST=210.122.123.52
-FTP_USER=ftpzero
-FTP_PASS='실제비밀번호'
-CONF
-chmod 600 /home/fundftp/.ftp_shinhan.conf
-```
+FTP 접속정보는 `ftp_shinhan_send.sh` 상단 `FTP_HOST / FTP_USER / FTP_PASS` 변수에 직접 넣어 사용한다.
+저장소에는 비밀번호를 `'********'` 로 마스킹해 두었으므로 서버 배포본에는 실제 비밀번호를 넣는다.
+서버 파일은 `chmod 700` 으로 fundftp 계정만 읽을 수 있게 한다.
 - 저장소 파일은 UTF-8 / LF 이다. 서버 로케일이 EUC-KR이면 `iconv -f UTF-8 -t EUC-KR` 로 변환해서 올린다 (한글은 주석뿐이라 동작에는 영향 없음).
 - `flock`, `timeout`, `md5sum` (util-linux / coreutils), bash 4 이상 필요.
 
@@ -32,5 +26,5 @@ chmod 600 /home/fundftp/.ftp_shinhan.conf
 | 1 | 재전송 후에도 크기/MD5 불일치 (서버 파일 0 byte 등) |
 | 2 | 로컬 파일 없음 또는 0 byte |
 | 3 | 다른 전송이 실행 중 (중복 실행 차단) |
-| 4 | 인자/설정 오류 |
+| 4 | 인자 오류 / 데이터 경로 오류 |
 | 255 | (TBOmain 측) ssh 접속 실패 |

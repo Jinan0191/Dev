@@ -17,7 +17,7 @@ fi
 #           1 : 전송 후 검증 실패 (재전송 후에도 크기/MD5 불일치)
 #           2 : 로컬 전송 파일 없음 또는 0 byte
 #           3 : 이미 다른 전송이 실행 중 (중복 실행)
-#           4 : 인자/설정 오류
+#           4 : 인자 오류 / 데이터 경로 오류
 #################################################
 
 export HOME=/home/fundftp
@@ -25,7 +25,12 @@ export PATH=$HOME/bin:$ORACLE_HOME/bin:/bin:/usr/bin:/sbin:/usr/sbin
 
 LOG=/home/fundftp/log
 DATA=/DATA/memb/shaitas
-CONF=$HOME/.ftp_shinhan.conf        # FTP_HOST / FTP_USER / FTP_PASS (chmod 600)
+
+# FTP 접속정보 (신한펀드파트너스 CrushFTP)
+FTP_HOST=210.122.123.52
+FTP_USER=ftpzero
+FTP_PASS='********'
+
 LOCK=$LOG/.ftp_shinhan_send.lock
 MAX_TRY=2                           # 검증 실패 파일 재전송 포함 최대 시도 횟수
 FTP_TIMEOUT=600                     # ftp 세션 최대 대기(초)
@@ -57,12 +62,6 @@ if ! flock -n 9; then
         msg "SHFUND FTP FAIL : another ftp_shinhan_send.sh is running (duplicate run skipped)"
         exit 3
 fi
-
-if [ ! -r $CONF ]; then
-        msg "SHFUND FTP FAIL : config file not found ($CONF)"
-        exit 4
-fi
-. $CONF
 
 echo "===========SHFUND START=========" >> $FEED_LOG
 echo "[${YMD}] `date`" >> $FEED_LOG
