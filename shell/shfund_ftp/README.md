@@ -15,6 +15,7 @@ FTP 접속정보는 `ftp_shinhan_send.sh` 상단 `FTP_HOST / FTP_USER / FTP_PASS
 ## 동작
 1. TBOmain.sh : flock 으로 중복 실행 방지 → R 파일 생성 → 준비 확인 → ssh 로 전송 스크립트 호출
    → **ssh 종료코드 0 일 때만** `[YMD] SHFUND NPS FTP SEND END` 기록 (실패 시 `SEND FAIL (RC:n)`).
+   → 전송완료 여부는 체크하지 않음 (다시 실행하면 재전송). 동시 실행만 flock 으로 차단.
 2. ftp_shinhan_send.sh : flock → 로컬 6개 파일 존재/크기/MD5 확인 → FTP 전송
    → CrushFTP `226 Transfer complete. MD5=... ("/파일" 크기)` 응답을 파일별로 로컬 크기·MD5와 비교
    → 불일치 파일만 1회 재전송 → 6/6 일치 시 `SHFUND FTP complete OK 6/6`, exit 0.

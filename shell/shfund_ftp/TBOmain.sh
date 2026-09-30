@@ -52,11 +52,8 @@ Rscript $RSRC_PATH/20.TBO316_make.R $YMD $YMD 1016 >> $LOG_PATH$LOG_FILE
 ###############################################################
 # 이 쉘이 직접 남기는 SHFUND 메시지(NOT READY/SEND END/SEND FAIL 등)는 준비 여부 판단에서 제외
 tbo_chk=`grep "$YMD" $LOG_PATH$LOG_FILE | grep SHFUND | grep -v -e "SHFUND NPS FILES ARE NOT READY" -e "SHFUND NPS FTP" -e "SHFUND FTP" | wc -l`
-send_chk=`grep -F "[${YMD}] SHFUND NPS FTP SEND END" $LOG_PATH$LOG_FILE | wc -l`
-if [ ${send_chk} -gt 0 ]; then
-	/bin/echo "[${YMD}] SHFUND NPS FTP ALREADY SENT ---------------------------------------" >> $LOG_PATH$LOG_FILE
-	exit;
-elif [ ${tbo_chk} -eq 0 ]; then
+# 2026.09.30 전송완료(ALREADY SENT) 체크 제거 : 재전송 허용, 동시 전송은 flock 으로 차단
+if [ ${tbo_chk} -eq 0 ]; then
 	/bin/echo "[${YMD}] SHFUND NPS FILES ARE NOT READY ------------------------------------" >> $LOG_PATH$LOG_FILE
 	exit;
 else
@@ -69,7 +66,7 @@ else
 	if [ ${send_rc} -eq 0 ]; then
 		/bin/echo "[${YMD}] SHFUND NPS FTP SEND END (6/6 VERIFIED)---------------------------" >> $LOG_PATH$LOG_FILE
 	else
-		# 1:검증실패 2:파일없음 3:중복실행 4:설정오류 255:ssh 접속 실패
+		# 1:검증실패 2:파일없음 3:중복실행 4:인자/경로 오류 255:ssh 접속 실패
 		/bin/echo "[${YMD}] SHFUND NPS FTP SEND FAIL (RC:${send_rc})---------------------------" >> $LOG_PATH$LOG_FILE
 	fi
 fi
