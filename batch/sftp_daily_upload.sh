@@ -20,7 +20,9 @@ REMOTE_USER="mirae"                  # 원격지 계정
 REMOTE_HOST="192.168.1.96"           # 원격지 호스트/IP
 REMOTE_PORT=7422                     # SFTP 포트
 REMOTE_ROOT="/"                      # 원격지 루트 디렉토리 (예: /upload)
-SSH_KEY="${HOME}/.ssh/id_rsa"        # 원격지에 public key 등록된 개인키
+# 원격지에 public key 등록된 개인키 - 반드시 절대경로로 지정
+#   ${HOME} 을 쓰면 다른 스크립트/cron/su 에서 호출될 때 다른 경로가 되어 인증 실패함
+SSH_KEY="/home/계정명/.ssh/id_rsa"
 
 LOCAL_BASE="/EXFS/fundftp/memb/mirae" # 날짜 디렉토리들의 상위 로컬 경로
 DATE_FMT="+%Y%m%d"                   # 날짜 디렉토리 형식
@@ -46,6 +48,13 @@ if ! flock -n 9; then
 fi
 
 log "===== SFTP 업로드 시작 (대상일자: ${TARGET_DATE}) ====="
+log "실행계정: $(id -un) / HOME: ${HOME:-없음} / KEY: ${SSH_KEY}"
+
+# 개인키 확인 (없거나 읽을 수 없으면 ssh 가 키를 건너뛰어 Permission denied 발생)
+if [[ ! -r "${SSH_KEY}" ]]; then
+    log "ERROR: 개인키를 읽을 수 없습니다: ${SSH_KEY} (실행계정: $(id -un))"
+    exit 3
+fi
 
 # 로컬 디렉토리 / 파일 확인
 if [[ ! -d "${LOCAL_DIR}" ]]; then
