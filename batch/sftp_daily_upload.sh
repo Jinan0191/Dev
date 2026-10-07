@@ -19,7 +19,7 @@ set -euo pipefail
 REMOTE_USER="mirae"                  # 원격지 계정
 REMOTE_HOST="192.168.1.96"           # 원격지 호스트/IP
 REMOTE_PORT=7422                     # SFTP 포트
-REMOTE_ROOT="/"                      # 원격지 루트 디렉토리 (예: /upload)
+REMOTE_ROOT="/data"                  # 원격지 루트 디렉토리
 # 원격지에 public key 등록된 개인키 - 반드시 절대경로로 지정
 #   ${HOME} 을 쓰면 다른 스크립트/cron/su 에서 호출될 때 다른 경로가 되어 인증 실패함
 SSH_KEY="/home/계정명/.ssh/id_rsa"
@@ -27,7 +27,7 @@ SSH_KEY="/home/계정명/.ssh/id_rsa"
 LOCAL_BASE="/EXFS/fundftp/memb/mirae" # 날짜 디렉토리들의 상위 로컬 경로
 DATE_FMT="+%Y%m%d"                   # 날짜 디렉토리 형식
 LOG_DIR="/EXFS/fundftp/log"          # 로그 디렉토리
-LOG_KEEP_DAYS=30                     # 로그 보관 일수
+LOG_KEEP_DAYS=400                    # 로그 보관 일수 (월별 파일, 마지막 기록일 기준 약 13개월)
 ########################################
 
 TARGET_DATE="${1:-$(date "${DATE_FMT}")}"
@@ -35,7 +35,7 @@ LOCAL_DIR="${LOCAL_BASE}/${TARGET_DATE}"
 REMOTE_DIR="${REMOTE_ROOT%/}/${TARGET_DATE}"
 
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/sftp_upload_${TARGET_DATE}.log"
+LOG_FILE="${LOG_DIR}/sftp_upload_${TARGET_DATE:0:6}.log"   # 월별 로그 (YYYYMM)
 LOCK_FILE="/tmp/sftp_daily_upload.lock"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}"; }
