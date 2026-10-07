@@ -16,15 +16,15 @@ set -euo pipefail
 ########################################
 # 설정 (환경에 맞게 수정)
 ########################################
-REMOTE_USER="remote_user"            # 원격지 계정
-REMOTE_HOST="remote.example.com"     # 원격지 호스트/IP
-REMOTE_PORT=6622                     # SFTP 포트
+REMOTE_USER="mirae"                  # 원격지 계정
+REMOTE_HOST="192.168.1.96"           # 원격지 호스트/IP
+REMOTE_PORT=7422                     # SFTP 포트
 REMOTE_ROOT="/"                      # 원격지 루트 디렉토리 (예: /upload)
 SSH_KEY="${HOME}/.ssh/id_rsa"        # 원격지에 public key 등록된 개인키
 
-LOCAL_BASE="/data/send"              # 날짜 디렉토리들의 상위 로컬 경로
+LOCAL_BASE="/EXFS/fundftp/memb/mirae" # 날짜 디렉토리들의 상위 로컬 경로
 DATE_FMT="+%Y%m%d"                   # 날짜 디렉토리 형식
-LOG_DIR="/data/logs/sftp"            # 로그 디렉토리
+LOG_DIR="/EXFS/fundftp/log"          # 로그 디렉토리
 LOG_KEEP_DAYS=30                     # 로그 보관 일수
 ########################################
 
@@ -65,13 +65,33 @@ if (( FILE_CNT == 0 )); then
 fi
 log "전송 대상 파일 수: ${FILE_CNT}"
 
-# SFTP 배치 명령 작성
-#   '-' 접두사: 해당 명령 실패해도 계속 진행 (디렉토리가 이미 있을 때 mkdir 실패 무시)
+# SFTP 공통 옵션
+#   구버전 OpenSSH 호환을 위해 -P(포트), -i(키) 대신 -o 옵션 사용
+#   (구버전 sftp 에서 -P 는 sftp_server_path 이고 -i 는 지원하지 않음)
+#   최초 1회는 수동 접속해서 호스트 키를 known_hosts 에 등록해 두어야 함
+SFTP_OPTS=(
+    -o "Port=${REMOTE_PORT}"
+    -o "IdentityFile=${SSH_KEY}"
+    -o BatchMode=yes
+    -o ConnectTimeout=30
+    -o ServerAliveInterval=30
+)
+
 BATCH_FILE="$(mktemp)"
 trap 'rm -f "${BATCH_FILE}"' EXIT
 
+set +e
+
+# 1) 원격 날짜 디렉토리 생성 (이미 있으면 실패하지만 무시)
+#    구버전은 배치파일의 '-' 접두사를 지원하지 않아 별도 세션으로 분리
+echo "mkdir \"${REMOTE_DIR}\"" > "${BATCH_FILE}"
+echo "bye" >> "${BATCH_FILE}"
+sftp -b "${BATCH_FILE}" "${SFTP_OPTS[@]}" \
+     "${REMOTE_USER}@${REMOTE_HOST}" >> "${LOG_FILE}" 2>&1
+log "원격 디렉토리 생성 시도 완료 (이미 있으면 실패 메시지는 무시): ${REMOTE_DIR}"
+
+# 2) 파일 전송
 {
-    echo "-mkdir \"${REMOTE_DIR}\""
     echo "cd \"${REMOTE_DIR}\""
     echo "lcd \"${LOCAL_DIR}\""
     for f in "${FILES[@]}"; do
@@ -81,15 +101,7 @@ trap 'rm -f "${BATCH_FILE}"' EXIT
     echo "bye"
 } > "${BATCH_FILE}"
 
-# 실행
-set +e
-sftp -b "${BATCH_FILE}" \
-     -P "${REMOTE_PORT}" \
-     -i "${SSH_KEY}" \
-     -o BatchMode=yes \
-     -o ConnectTimeout=30 \
-     -o ServerAliveInterval=30 \
-     -o StrictHostKeyChecking=accept-new \
+sftp -b "${BATCH_FILE}" "${SFTP_OPTS[@]}" \
      "${REMOTE_USER}@${REMOTE_HOST}" >> "${LOG_FILE}" 2>&1
 RC=$?
 set -e
