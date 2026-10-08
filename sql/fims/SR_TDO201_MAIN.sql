@@ -35,6 +35,7 @@ IS
         DEPOSIT_3Y      VARCHAR2(1),   -- 예금 3년 만기일 표시
         T36_JY_YN       VARCHAR2(1),   -- 예금 3년 만기 익영업일 (설정액 재설정, 신규 이율 적용 시작)
         MAT_YMD         VARCHAR2(8),   -- 가장 최근 도래 만기일
+        CYC_FROM_YMD    VARCHAR2(8),   -- 가장 최근 도래 만기의 주기 시작일
         FIX_MAT_RT      NUMBER         -- 적용 이율 (비고 기록용)
     );
 
@@ -42,7 +43,8 @@ IS
        P_YMD      : 평가 기준일
        P_COMP_YMD : 구성 조회 기준일 (당일 구성 = P_YMD, 리밸런싱일의 기존 구성 = 전영업일)
        RBC_YMD    : 당일이 리밸런싱(변경승인)일이면 P_YMD  - 전영업일 익일 ~ 당일 사이 승인 존재
-       RBC_BF_YN  : 전영업일이 리밸런싱일이면 'Y'        - 당일이 변경 포트폴리오 재투자일 */
+       RBC_BF_YN  : 전영업일이 리밸런싱일이면 'Y'        - 당일이 변경 포트폴리오 재투자일
+       S.START_YMD: 성과산출 시작일 (PYUNGA_GB = 'Y' 최초 이력의 FROM_YMD), 이전 승인은 리밸런싱으로 보지 않음 */
     CURSOR C_COMP (P_YMD VARCHAR2, P_COMP_YMD VARCHAR2, P_PRD VARCHAR2) IS
                 SELECT SEOLJ_YMD, FROM_YMD
                   , CASE WHEN A.FUND_TYPE_GB = 'I'                                        -- ★① TDO101N2 재조회 제거: 인라인뷰 FROM_YMD 재사용
@@ -61,16 +63,16 @@ IS
                                 WHEN A.FUND_TYPE_GB = 'F' AND A.FROM_YMD >= A.FUND_SEOLJ_YMD THEN A.FROM_YMD
                                 WHEN A.FUND_TYPE_GB = 'I' THEN CAST(NULL AS VARCHAR2(8))  -- ★① 외곽에서 FROM_YMD 기반으로 휴일보정
                                 WHEN A.FUND_TYPE_GB IN ('A','B','C') THEN
-                                    /* 예금 이율·만기 기준일 : 가장 최근 변경승인일(영업일 보정), 승인 이력이 없으면 최초 설정 이력의 FROM_YMD
-                                       - 리밸런싱 시 기존 예금도 매도 후 재투자되므로 승인일 기준 이율로 새로 시작 */
+                                    /* 예금 이율·만기 기준일 : 성과산출 시작일 이후 가장 최근 변경승인일(영업일 보정),
+                                       승인 이력이 없으면 성과산출 시작일(PYUNGA_GB = 'Y' 최초 이력의 FROM_YMD)
+                                       - 리밸런싱 시 기존 예금도 매도 후 재투자되므로 승인일 기준 이율로 새로 시작
+                                       - 시작일 이전 승인(설정 전 변경승인)은 리밸런싱이 아님 */
                                     NVL( (SELECT DECODE(F_HUIL_GB(MAX(R.APRV_YMD)), '0', MAX(R.APRV_YMD), FIMS.F_AF_YONG_YMD(MAX(R.APRV_YMD)))
                                             FROM TDO001R R
                                            WHERE R.PRD_CD    = A.PRD_CD
                                              AND R.APRV_YMD <= A.FROM_YMD
-                                             AND R.APRV_YMD >  (SELECT MIN(P.FROM_YMD) FROM TDO001 P
-                                                                 WHERE P.PRD_CD = A.PRD_CD AND P.SEOLJ_YMD = A.SEOLJ_YMD)),
-                                         (SELECT MIN(P.FROM_YMD) FROM TDO001 P
-                                           WHERE P.PRD_CD = A.PRD_CD AND P.SEOLJ_YMD = A.SEOLJ_YMD) )
+                                             AND R.APRV_YMD >  S.START_YMD),
+                                         S.START_YMD )
                                 ELSE A.FROM_YMD END AS UY_YMD
                         , A.END_YMD
                         , A.PRD_CD
@@ -84,14 +86,22 @@ IS
                         , CASE WHEN EXISTS (SELECT 1 FROM TDO001R R
                                              WHERE R.PRD_CD = A.PRD_CD
                                                AND R.APRV_YMD >  WA_BF_YMD
-                                               AND R.APRV_YMD <= P_YMD) THEN P_YMD
+                                               AND R.APRV_YMD <= P_YMD
+                                               AND R.APRV_YMD >  S.START_YMD) THEN P_YMD
                                ELSE '99999999' END AS RBC_YMD
                         , CASE WHEN EXISTS (SELECT 1 FROM TDO001R R
                                              WHERE R.PRD_CD = A.PRD_CD
                                                AND R.APRV_YMD >  W_BF2_YMD
-                                               AND R.APRV_YMD <= WA_BF_YMD) THEN 'Y'
+                                               AND R.APRV_YMD <= WA_BF_YMD
+                                               AND R.APRV_YMD >  S.START_YMD) THEN 'Y'
                                ELSE 'N' END AS RBC_BF_YN
                       FROM TDO001 A
+                      JOIN (SELECT PRD_CD, MIN(FROM_YMD) AS START_YMD           -- 성과산출 시작일 : 평가대상(PYUNGA_GB = 'Y') 최초 이력의 FROM_YMD
+                              FROM TDO001
+                             WHERE NVL(PYUNGA_GB, 'Y') = 'Y'
+                               AND PRD_CD LIKE P_PRD
+                             GROUP BY PRD_CD) S
+                        ON S.PRD_CD = A.PRD_CD
                     WHERE A.SEOLJ_YMD = (SELECT MAX(SEOLJ_YMD) FROM TDO001 WHERE PRD_CD = A.PRD_CD AND SEOLJ_YMD <= P_YMD)
                       AND Nvl(A.PYUNGA_GB, 'Y') = 'Y'
                       AND Nvl(A.HAEJI_YMD, '99999999') >= P_YMD
@@ -165,10 +175,11 @@ IS
         L_GA_TODAY     NUMBER;
         L_RT           NUMBER;
     BEGIN
-        V.DEPOSIT_3Y := NULL;
-        V.T36_JY_YN  := 'N';
-        V.MAT_YMD    := NULL;
-        V.FIX_MAT_RT := NULL;
+        V.DEPOSIT_3Y   := NULL;
+        V.T36_JY_YN    := 'N';
+        V.MAT_YMD      := NULL;
+        V.CYC_FROM_YMD := NULL;
+        V.FIX_MAT_RT   := NULL;
 
         /* 예금 */
         IF R.FUND_TYPE_GB IN ('A', 'B', 'C') THEN
@@ -185,17 +196,19 @@ IS
 
                 L_MAT_YMD := GET_MAT_YMD(L_CYC_FROM);
 
-                EXIT WHEN L_MAT_YMD IS NULL OR L_MAT_YMD > P_YMD;
+                EXIT WHEN L_MAT_YMD IS NULL OR L_MAT_YMD > P_YMD
+                       OR L_MAT_YMD <= L_CYC_FROM;      -- 기간 테이블 이상 데이터 방어
 
                 IF L_MAT_YMD = P_YMD THEN          -- 오늘이 만기일
                     V.DEPOSIT_3Y := 'Y';
                     EXIT;
                 END IF;
 
-                L_JY_YMD   := FIMS.F_AF_YONG_YMD(L_MAT_YMD);   -- 만기 익영업일 (<= P_YMD)
-                V.MAT_YMD  := L_MAT_YMD;
-                L_RATE_YMD := L_JY_YMD;
-                L_CYC_FROM := L_JY_YMD;                        -- 새 주기 시작일 = 만기 익영업일
+                L_JY_YMD       := FIMS.F_AF_YONG_YMD(L_MAT_YMD);   -- 만기 익영업일 (<= P_YMD)
+                V.MAT_YMD      := L_MAT_YMD;
+                V.CYC_FROM_YMD := L_CYC_FROM;
+                L_RATE_YMD     := L_JY_YMD;
+                L_CYC_FROM     := L_JY_YMD;                        -- 새 주기 시작일 = 만기 익영업일
             END LOOP;
 
             -- 이자 일수는 전영업일 익일 ~ 당일 (휴일 포함). 운용개시일 당일만 당일 1일
@@ -351,6 +364,32 @@ IS
           , P_IP_USER, SYSDATE);
     END INS_VAL;
 
+    /* 비고(TDO001.REM)의 3년 만기 문구 재구성
+       - 이번 만기 주기 시작일(P_CYC_FROM) 이후 날짜의 기존 3년 만기 문구는 제거 후 이번 만기 문구 추가
+         (재처리 시 중복 방지, 시작일 변경 등으로 잘못 기록된 문구 자동 정리)
+       - 이전 주기 만기 문구와 3년 만기 외 비고 내용은 유지 */
+    FUNCTION BUILD_REM (P_REM IN VARCHAR2, P_CYC_FROM IN VARCHAR2, P_MAT_YMD IN VARCHAR2, P_RATE IN NUMBER) RETURN VARCHAR2 IS
+        C_PAT   CONSTANT VARCHAR2(100) := '/? ?3년 만기\([0-9]{8}\)[^/]*/?';
+        L_BASE  VARCHAR2(4000);
+        L_KEEP  VARCHAR2(4000);
+        L_ENT   VARCHAR2(4000);
+        L_DT    VARCHAR2(8);
+    BEGIN
+        L_BASE := TRIM(REGEXP_REPLACE(REGEXP_REPLACE(P_REM, C_PAT, ' '), ' {2,}', ' '));
+
+        FOR I IN 1 .. NVL(REGEXP_COUNT(P_REM, C_PAT), 0) LOOP
+            L_ENT := REGEXP_SUBSTR(P_REM, C_PAT, 1, I);
+            L_DT  := REGEXP_SUBSTR(L_ENT, '[0-9]{8}');
+            IF L_DT < P_CYC_FROM
+               AND INSTR(NVL(L_KEEP, ' '), '3년 만기(' || L_DT || ')') = 0 THEN
+                L_KEEP := L_KEEP || ' / ' || REGEXP_REPLACE(L_ENT, '^[/ ]+|[/ ]+$', '');
+            END IF;
+        END LOOP;
+
+        RETURN SUBSTR(TRIM(L_BASE || L_KEEP
+                           || ' / 3년 만기(' || P_MAT_YMD || ') : ' || TO_CHAR(P_RATE, 'FM9990.00') || '%'), 1, 1000);
+    END BUILD_REM;
+
     /* 개별자산 1건 평가 및 저장 */
     PROCEDURE PROCESS_FUND (R IN C_COMP%ROWTYPE, P_YMD IN VARCHAR2) IS
         L_PREV      T_PREV;
@@ -358,6 +397,7 @@ IS
         L_000_TOT   NUMBER;
         L_AMT       NUMBER;
         L_GA        NUMBER;
+        L_REM       VARCHAR2(1000);
     BEGIN
         W_CUR_PRD_CD  := R.PRD_CD;
         W_CUR_FUND_CD := R.FUND_CD;
@@ -590,16 +630,18 @@ IS
         INS_VAL(R, P_YMD, L_VAL);
 
         IF L_VAL.T36_JY_YN = 'Y' THEN
-            UPDATE TDO001 A  -- 기본정보 비고 : 만기 도래일과 변경 이율 기록 (재처리 시 같은 만기일 문구는 교체하여 중복 방지)
-              SET REM = TRIM(
-                          TRIM(REGEXP_REPLACE(A.REM, '/ ?3년 만기\(' || L_VAL.MAT_YMD || '\)[^/]*', ''))
-                          || ' / 3년 만기(' || L_VAL.MAT_YMD || ') : '
-                          || TO_CHAR(L_VAL.FIX_MAT_RT, 'FM9990.00') || '%'
-                        )
-            WHERE A.PRD_CD  = R.PRD_CD
-              AND A.FUND_CD = R.FUND_CD
-              AND A.END_YMD = (SELECT /*+ INDEX(TDO001 TDO001_SK) */ MIN(END_YMD)
-                                  FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= P_YMD);
+            -- 기본정보 비고 : 만기 도래일과 변경 이율 기록 (재처리 시 중복 없이 재구성)
+            FOR T IN (SELECT A.ROWID AS RID, A.REM
+                        FROM TDO001 A
+                       WHERE A.PRD_CD  = R.PRD_CD
+                         AND A.FUND_CD = R.FUND_CD
+                         AND A.END_YMD = (SELECT /*+ INDEX(TDO001 TDO001_SK) */ MIN(END_YMD)
+                                            FROM TDO001 WHERE PRD_CD = A.PRD_CD AND END_YMD >= P_YMD)) LOOP
+                L_REM := BUILD_REM(T.REM, L_VAL.CYC_FROM_YMD, L_VAL.MAT_YMD, L_VAL.FIX_MAT_RT);
+                IF NVL(T.REM, ' ') <> L_REM THEN
+                    UPDATE TDO001 SET REM = L_REM WHERE ROWID = T.RID;
+                END IF;
+            END LOOP;
         END IF;
     END PROCESS_FUND;
 
@@ -655,7 +697,11 @@ BEGIN
                                                  AND END_YMD >= CASE WHEN EXISTS (SELECT 1 FROM TDO001R R
                                                                                    WHERE R.PRD_CD = A.PRD_CD
                                                                                      AND R.APRV_YMD >  WA_BF_YMD
-                                                                                     AND R.APRV_YMD <= D1.YMD)
+                                                                                     AND R.APRV_YMD <= D1.YMD
+                                                                                     AND R.APRV_YMD >  (SELECT MIN(P.FROM_YMD)    -- 성과산출 시작일 이후 승인만 리밸런싱
+                                                                                                          FROM TDO001 P
+                                                                                                         WHERE P.PRD_CD = A.PRD_CD
+                                                                                                           AND NVL(P.PYUNGA_GB, 'Y') = 'Y'))
                                                                      THEN WA_BF_YMD
                                                                      ELSE D1.YMD END));
 
